@@ -6,6 +6,7 @@ import threading
 import logging
 import os.path
 import sys
+import traceback
 import time
 import random
 from collections import defaultdict
@@ -14,6 +15,7 @@ import tornado.ioloop
 import tornado.httpserver
 import tornado.process
 import tornado.web
+import tornado.gen
 
 from tornado.options import define, options
 from tornado.netutil import bind_unix_socket
@@ -146,7 +148,7 @@ class Singleton(type):
     def __call__(cls, *args, **kwargs):
         if cls not in cls._instances:
             cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
-        return cls._instances[cls].__init__(*args, **kwargs)
+        return cls._instances[cls]
 
 class CacheCore(object):
     __metaclass__ = Singleton
@@ -155,9 +157,8 @@ class CacheCore(object):
     pending = defaultdict(set)
     key_map = {}
 
-    REFILL_TIMEOUT = 4 * 1000  # ms
+    REFILL_TIMEOUT = 1 * 1000  # ms
     NOT_FOUND = "__NOT_FOUND__"
-
 
     def __init__(self, memcache=None, io_loop=None):
         self.memcache = memcache or defaultdict(dict)
@@ -177,17 +178,17 @@ class CacheCore(object):
             return None
 
     def add_pending(self, uuid, callback):
-        logging.info("adding pending callback %s for uuid %s" % (callback, uuid))
         self._pending[uuid].add(callback)
 
     def remove_pending(self, uuid, callback):
-        logging.info("remove pending callback %s for uuid %s" % (callback, uuid))
         callbacks = self._pending[uuid]
         if callback in callbacks:
             logging.info("removed callback: %s" % callback)
             callbacks.remove(callback)
         del self._pending[uuid]
-        logging.info("inside remove_pending with %d" % len(self._pending))
+        l = len(self._pending)
+        if l > 0:
+            logging.info("inside remove_pending with %d" % l)
 
     def _fill(self):
         raise Exception("fill me")
@@ -198,21 +199,27 @@ class MyCache(CacheCore):
         if not self._pending:
             return
 
-        logging.info("inside _fill with %s %d" % (self._pending, len(self._pending)))
         self.pending = self._pending
         self._pending = defaultdict(set)
 
+        # This is the natural base case before entering the fill routine.
         for uuid in self.pending:
-            self.key_map[uuid] = self.NOT_FOUND
+            self.key_map[uuid] = None
 
         try:
             logging.info("filling %d caches", len(self.pending))
 
             # XXX Test with random data
-            for x in self.key_map.keys():
-                self.key_map[x] = random.randint(0,100)
-            logging.info("long task taking ...")
-            time.sleep(2)
+            logging.info("filling %s ..." % ','.join(self.pending.keys()))
+            for uuid in self.pending.keys():
+                n = random.randint(0,2)
+
+                if n == 0:
+                    self.key_map[uuid] = random.randint(0,100)
+                elif n == 1:
+                    self.key_map[uuid] = None
+                elif n == 2:
+                    self.key_map[uuid] = self.NOT_FOUND
 
             # schedule the outrun
             for callbacks in self.pending.itervalues():
@@ -234,6 +241,8 @@ class MyAsyncCacheHandler(BaseHandler):
     def prepare(self):
         self.cache = MyCache()
         self.uuid = self.get_argument("uuid")
+        if self.cache is None:
+            traceback.print_exc(file=sys.stdout)
 
     @classmethod
     def async_expensive(cls, method):
@@ -259,15 +268,13 @@ class MyAsyncCacheHandler(BaseHandler):
             self.error(400, "expensive failed, not exist!")
 
         else:
-            logging.info("cache hit! [%s] for %s %s" % (self.value, self.uuid, callback))
             callback()
 
     def cleanup(self):
-        logging.info("cleaning up for %s" % self.uuid)
+        logging.info("removing pending callback for %s=%s" % (self.uuid, self.value))
         self.cache.remove_pending(self.uuid, self.callback)
 
     def on_finish(self):
-        logging.info("finished with %s" % self.uuid)
         self.cleanup()
 
     def on_connection_close(self):
@@ -278,7 +285,6 @@ class BatchCacheHandler(MyAsyncCacheHandler):
 
     @MyAsyncCacheHandler.async_expensive
     def get(self):
-        logging.info("processing get....")
         self.write("handing GET request for uuid %s %s\n" % (self.uuid,self.value))
         self.flush()
         self.finish()
